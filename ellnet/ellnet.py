@@ -107,6 +107,8 @@ class BroadcastSocket(object):
 ###############################################################################
 # LNet server base class. 
 ###############################################################################
+_bc_struct = struct.Struct('=HI')
+
 class EllNetBaseServer(object):
     def __init__(self, dev, tcp_port, udp_port):
         self._dev      = dev
@@ -151,14 +153,14 @@ class EllNetBaseServer(object):
 
     def _broadcast_handler(self, addr, port, data):
         # Ignore our own broadcasts. 
-        pkt_type, n_bytes = struct.unpack('=HI', data[:6])
+        pkt_type, n_bytes = _bc_struct.unpack(data[:6])
         data = data[6:]
         if pkt_type in self._bc_handlers:
             self._bc_handlers[pkt_type](addr, port, data)
                 
                 
     def _send_broadcast_packet(self, pkt_type, data):
-        packet = struct.pack('=HI', pkt_type, len(data)) + data
+        packet = _bc_struct.pack(pkt_type, len(data)) + data
         try:
             self._broadcaster.send_broadcast(packet)
         except Exception, ex:

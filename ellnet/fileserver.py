@@ -69,6 +69,8 @@ class FileServer(ellnet.EllNetBaseServer):
             PKT_ADVERT : self._handle_advert
             }
 
+        self._read_struct = struct.Struct('=QQ')
+
         ellnet.EllNetBaseServer.__init__(self, dev, TCP_PORT, UDP_PORT)
         
         # Start advert thread. 
@@ -219,7 +221,7 @@ class FileServer(ellnet.EllNetBaseServer):
     # File transfers. 
     ##################################################################
     def read(self, addr, rpath, size, offset):
-        req_data = struct.pack('=QQ', size, offset) + rpath
+        req_data = self._read_struct.pack(size, offset) + rpath
         
         sock = ellnet.init_request(self._dev, 
                                    addr, 
@@ -232,7 +234,7 @@ class FileServer(ellnet.EllNetBaseServer):
 
     
     def _handle_read(self, sock, req_data):
-        size, offset = struct.unpack('=QQ', req_data[:16])
+        size, offset = self._read_struct.unpack(req_data[:16])
         path = self.get_full_path(req_data[16:].decode('utf8'))
         
         with open(path, 'rb') as f:
