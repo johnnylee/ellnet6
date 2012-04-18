@@ -1,0 +1,451 @@
+#!/usr/bin/env python
+
+# Copyright (c) 2012 J. David Lee. All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without 
+# modification, are permitted provided that the following conditions are
+# met:
+#
+#    1. Redistributions of source code must retain the above copyright
+#       notice, this list of conditions and the following disclaimer.
+#
+#    2. Redistributions in binary form must reproduce the above
+#       copyright notice, this list of conditions and the following
+#       disclaimer in the documentation and/or other materials provided
+#       with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+# ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+# HOLDERS OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+# INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+# BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+# OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+# ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+# TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+# USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH
+# DAMAGE.
+
+
+#
+# ellnetfs: a FUSE filesystem for mounting an nearby machine's shares. 
+# usage: ./ellnetfs <dev> <name> <shared path> <mountpoint>
+# unmount with fusermount -u <mountpoint>
+# 
+
+import os
+import sys
+import stat
+import errno
+#import struct
+import time
+import fuse
+fuse.fuse_python_api = (0, 2)
+
+#import ellnet
+from ellnet import fileserver
+
+###############################################################################
+# Constants
+###############################################################################
+ADVERT_INTERVAL = 8
+PURGE_TIME      = 32
+CACHE_TIME      = 8
+
+
+###############################################################################
+# Stat structure. 
+###############################################################################
+class FSStat(fuse.Stat):
+    def __init__(self, is_dir, size=4096):
+        fuse.Stat.__init__(self)
+
+        if is_dir:
+            self.st_mode  = stat.S_IFDIR | 0755
+            self.st_nlink = 2 
+        else:
+            self.st_mode  = stat.S_IFREG | 0644
+            self.st_nlink = 1
+
+        self.st_size  = size
+        self.st_atime = int(time.time())
+        self.st_mtime = self.st_atime
+        self.st_ctime = self.st_atime
+
+
+###############################################################################
+# Utility functions.
+###############################################################################
+def is_root(path):
+    return path.strip() == '/'
+
+
+def name_rpath(path):
+    assert not is_root(path)
+    
+    path = os.path.normpath(path)
+        
+    dirs = []
+
+    while 1:
+        path, dir_ = os.path.split(path)
+        
+        if dir_ != '':
+            dirs.append(dir_)
+        else:
+            break
+
+    dirs.reverse()
+    
+    addr  = dirs[0]
+    rpath = '/' + '/'.join(dirs[1:])
+    
+    return addr, os.path.normpath(rpath)
+
+
+def get_parent(rpath):
+    assert not is_root(rpath)
+    rpath = os.path.normpath(rpath)
+    return os.path.normpath(os.path.split(rpath)[0])
+
+
+###############################################################################
+# StatCache 
+###############################################################################
+class FSCache(object):
+    def __init__(self, fs):
+        self._fs = fs
+        self._listings = {}
+        self._stats    = {}
+        
+        self._l_times = [] # List of tuples (listing_time, addr, rpath)
+        self._s_times = [] # List of tuples (stat_time, addr, path)
+
+
+    def _purge(self):
+        now = time.time()
+
+        while (len(self._l_times) > 0 and 
+               now - self._l_times[0][0] > CACHE_TIME):
+            listing_time, addr, rpath = self._l_times.pop(0)
+            try:
+                del self._listings[addr][rpath]
+                if len(self._listings[addr]) == 0:
+                    del self._listings[addr]
+            except:
+                print('FSCache._purge exception:')
+                print(ex)
+                
+        while (len(self._s_times) > 0  and 
+               now - self._s_times[0][0] > CACHE_TIME):
+            stat_time, addr, path = self._s_times.pop(0)
+            try:
+                del self._stats[addr][path]
+                if len(self._stats[addr]) == 0:
+                    del self._stats[addr]
+            except:
+                print('FSCache._purge exception:')
+                print(ex)
+
+
+    def get_listing(self, addr, rpath):
+        self._purge()
+
+        rpath = os.path.normpath(rpath)
+        
+        if not addr in self._listings:
+            self._listings[addr] = {}
+
+        now = time.time()
+            
+        if not rpath in self._listings[addr]:
+            dirs, files = self._fs.get_listing(addr, rpath)
+            self._listings[addr][rpath] = (dirs, files)
+            self._l_times.append((now, addr, rpath))
+            
+            if not addr in self._stats:
+                self._stats[addr] = {}
+                
+            for d in dirs:
+                path = os.path.normpath(os.path.join(rpath, d))
+                self._stats[addr][path] = FSStat(True)
+                self._s_times.append((now, addr, path))
+
+            for f, size in files:
+                path = os.path.normpath(os.path.join(rpath, f))
+                self._stats[addr][path] = FSStat(False, size)
+                self._s_times.append((now, addr, path))
+
+        return self._listings[addr][rpath]
+
+
+    def get_stat(self, addr, rpath):
+        self._purge()
+        
+        rpath = os.path.normpath(rpath)
+        
+        if is_root(rpath):
+            return FSStat(True)
+        
+        if addr in self._stats and rpath in self._stats[addr]:
+            return self._stats[addr][rpath]
+        
+        par_path = get_parent(rpath)
+        self.get_listing(addr, par_path)
+        
+        try:
+            return self._stats[addr][rpath]
+        except:
+            return -errno.ENOENT
+
+
+###############################################################################
+# Resolver
+###############################################################################
+class Resolver(object):
+    def __init__(self, fs, purge_time=32):
+        self._fs         = fs
+        self._purge_time = purge_time
+
+        self._addrs = {} # Map from names to addresses. 
+        self._names = {} # Map from addresses to names. 
+
+
+    def _unique_name(self, name):
+        new_name = name
+        i = 0
+        while new_name in self._addrs.keys():
+            new_name = name + str(i)
+            i += 1
+            
+        return new_name
+
+
+    def update(self):
+        """Update the resolver from the fileserver object."""
+        self._fs.purge_hosts(self._purge_time)
+        addrs = []
+        for addr, name, msg, age in self._fs.get_hosts():
+            addrs.append(addr)
+            self._update(name, addr)
+            
+        # Remove stale hosts. 
+        for addr in self._names.keys():
+            if not addr in addrs:
+                name = self._names[addr]
+                del self._addrs[name]
+                del self._names[addr]
+
+
+    def _update(self, name, addr):
+        """Update the resolver with the name and address pair. The name may
+        change to make it unique. 
+        
+        Return: the name. 
+        """
+        # Remove old entries, keep old name if it exists. 
+        if addr in self._names:
+            name = self._names[addr]
+            del self._addrs[name]
+            del self._names[addr]
+        
+        # Insert with unique name. 
+        name = self._unique_name(name)
+        self._addrs[name] = addr
+        self._names[addr] = name
+        
+        return name
+            
+            
+    def get_addr(self, name):
+        """Given a name, return the associated address or None on failure."""
+        try:
+            return self._addrs[name]
+        except:
+            return None
+        
+        
+    def get_addrs(self):
+        """Return a list of known addresses."""
+        return self._names.keys()
+
+
+    def get_name(self, addr):
+        """Given an address, return the associated name or None on failure."""
+        try:
+            return self._names[addr]
+        except:
+            return None
+
+
+    def get_names(self):
+        """Return a list of known hostnames."""
+        return self._addrs.keys()
+    
+        
+###############################################################################
+# Filesystem class. 
+###############################################################################
+class EllNetFS(fuse.Fuse):
+    def __init__(self, dev, name, share_dir, *args, **kw):
+        fuse.Fuse.__init__(self, *args, **kw)
+        
+        self._dev       = dev
+        self._name      = name
+        self._share_dir = share_dir
+        
+
+    def fsinit(self):
+        print('fsinit()')
+        try:
+            fs = fileserver.FileServer(self._dev, 
+                                       self._name, 
+                                       '',
+                                       self._share_dir, 
+                                       ADVERT_INTERVAL)
+            self._fs     = fs
+            self._resolv = Resolver(fs)
+            self._cache  = FSCache(fs)
+        except Exception, ex:
+            print('EllNetFS.fsinit: Exception:')
+            print(ex)
+        
+
+    def getattr(self, path):
+        print('getattr(' + path + ')')
+        if is_root(path):
+            return FSStat(True)
+        
+        name, rpath = name_rpath(path)
+        
+        addr = self._resolv.get_addr(name)
+        
+        if addr is None:
+            print('Unknown host: ' + name + rpath)
+            return -errno.ENOENT
+        
+        return self._cache.get_stat(addr, rpath)
+
+
+    def readdir(self, path, offset):
+        print('readdir(' + path + ', ' + str(offset) + ')')
+
+        dirents = ['.', '..']
+ 
+        # The root directory just contains names from the resolver. 
+        if is_root(path):
+            self._resolv.update()
+            for name in self._resolv.get_names():
+                dirents.append(name)
+                
+        # Any other directories will need to be fetched from the particular
+        # host. 
+        else:
+            name, rpath = name_rpath(path)
+            addr = self._resolv.get_addr(name)
+            
+            if addr is None:
+                 yield -errno.ENOENT
+
+            dirs, files = self._cache.get_listing(addr, rpath)
+            
+            for d in dirs:
+                dirents.append(d.encode('utf8'))
+            for f, size in files:
+                dirents.append(f.encode('utf8'))
+                
+        for e in dirents:
+            yield fuse.Direntry(e)
+
+                
+    def open(self, path, flags):
+        return 0
+
+
+    def read(self, path, size, offset):
+        print('read(' + path + ', ' + str(size) + ', ' + str(offset))
+        name, rpath = name_rpath(path)
+        addr = self._resolv.get_addr(name)
+        
+        if addr is None:
+            return -errno.ENOENT
+        
+        return self._fs.read(addr, rpath, size, offset)
+     
+
+    def release(self, path, flags):
+        return 0
+         
+
+    def mknod(self, path, mode, dev):
+        return -errno.EROFS
+
+    
+    def unlink(self, path):
+        return -errno.EROFS
+
+    
+    def write(self, path, buf, offset):
+        return -errno.EROFS
+    
+
+    def truncate(self, path, size):
+        return -errno.EROFS
+    
+
+    def mkdir(self, path, mode):
+        return -errno.EROFS
+    
+
+    def rmdir(self, path):
+        return -errno.EROFS
+    
+
+    def rename(self, pathfrom, pathto):
+        return -errno.EROFS
+    
+
+    def fsync(self, path, isfsyncfile):
+        return -errno.EROFS
+  
+
+    def utime(self, path, times):
+        return -errno.ENOSYS
+    
+
+
+if __name__ == '__main__':
+    usage="""
+    EllNetFS: A filesystem showing remote shares. 
+    """ + fuse.Fuse.fusage
+    
+    try:
+        dev       = sys.argv[1]
+        name      = sys.argv[2]
+        share_dir = sys.argv[3]
+        
+        # Is there a simple way to ensure that dev exists?
+        
+        # Make sure shared directory exists. 
+        if not os.path.exists(share_dir) and os.path.isdir(share_dir):
+            raise Exception("Shared directory doesn't exist.")
+
+        sys.argv = [sys.argv[0]] + sys.argv[4:]
+        
+        # Make sure we have enough arguments left for fuse.
+        if len(sys.argv) < 2:
+            raise Exception('Too few arguments.')
+        
+        server = EllNetFS(dev, name, share_dir, 
+                          version="%prog " + fuse.__version__,
+                          usage=usage, dash_s_do='setsingle')
+        server.parse(errex=1)
+        server.main()
+        
+    except Exception, ex:
+        print('Exception: ')
+        print(ex)
+        print('Usage: ellnetfs <device> <name> <shared path> <mount point>')
+        sys.exit(1)
+
