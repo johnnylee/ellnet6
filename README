@@ -1,6 +1,6 @@
 
 EllNet ("Ell" for "L" for "Local") is a simple, pure-python  network 
-framework for creating client-server applications using the ipv6 link-
+framework for creating client-server applications using the IPv6 link-
 local address space. 
 
 The ellnet.py file contains the main class, EllNetBaseServer, which 
@@ -17,7 +17,7 @@ directories shared by other machines in the link-local address space
 using the fileserver.FileServer object. It is used as follows:
 
 On machine A we want to share the directory ~/media, and we want to 
-be known as "machineA" to other's on the network. We want other's 
+be known as "machineA" to others on the network. We want other's 
 shares to appear in ~/shared. If our network device is wlan0, we 
 would run ellnetfs as:
     
@@ -32,7 +32,7 @@ interface and directories):
 
     ellnetfs wlan1 machineB ~/my_shared_files ~/shared
 
-As long as the machines are in the same ipv6 network segment, they 
+As long as the machines are in the same IPv6 network segment, they 
 should see each other's shared files. 
 
 
